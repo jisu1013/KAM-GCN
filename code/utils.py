@@ -1,10 +1,12 @@
 import numpy as np
 import scipy.sparse as sp
 import torch
+import torch.nn.functional as F
 import sys
 import pickle as pkl
 import numpy as np
 import networkx as nx
+#from config import Config
 
 #utils : https://github.com/tkipf/pygcn/blob/master/pygcn/utils.py 
 
@@ -19,15 +21,49 @@ def common_loss(emb1, emb2): #3.4.1 consistency constraint
     return cost
 
 
-def loss_dependence(emb1, emb2, dim): #3.4.2 disparity constraint
+def loss_dependence(emb1, emb2, dim): #3.4.2 disparity constraint    
     R = torch.eye(dim).cuda() - (1/dim) * torch.ones(dim, dim).cuda()
+    R = R.cuda()
     K1 = torch.mm(emb1, emb1.t())
     K2 = torch.mm(emb2, emb2.t())
     RK1 = torch.mm(R, K1)
-    RK2 = torch.mm(R, K2)
+    RK2 = torch.mm(R, K2)   
     HSIC = torch.trace(torch.mm(RK1, RK2))
+    #HSIC = HSIC.cuda()
     return HSIC
 
+#KGAT
+def calc_cf_loss(config, user_embed, item_embed, user_ids, item_pos_ids, item_neg_ids):
+    '''
+    user_ids: (cf_batch_size)
+    item_pos_ids: (cf_batch_size)
+    item_neg_ids: (cf_batch_size)
+    '''
+    #print(user_ids)
+    user_embed = user_embed[user_ids]
+    item_pos_embed = item_embed[item_pos_ids]
+    item_neg_embed = item_embed[item_neg_ids]
+    #print(item_pos_embed.shape)
+    #print(item_neg_embed.shape)
+    #print(user_embed.shape)
+    #equation (12) e_u*e_i
+    pos_score = torch.sum(user_embed * item_pos_embed, dim=1)
+    neg_score = torch.sum(user_embed * item_neg_embed, dim=1)
+
+    #equation (13)
+    cf_loss = (-1.0) * F.logsigmoid(pos_score - neg_score)
+    cf_loss = torch.mean(cf_loss)
+
+    l2_loss = _L2_loss_mean(user_embed) + _L2_loss_mean(item_pos_embed) + _L2_loss_mean(item_neg_embed)
+    loss = cf_loss + config.cf_l2loss_lambda * l2_loss
+    return loss
+
+def _L2_loss_mean(x):
+    return torch.mean(torch.sum(torch.pow(x,2),dim=1, keepdim=False) / 2.)
+
+def cf_score(user_embed, item_embed, user_ids, item_ids):
+    cf_score = torch.matmul(user_embed, item_embed.transpose(0,1))
+    return cf_score
 
 def accuracy(output, labels):
     preds = output.max(1)[1].type_as(labels)
@@ -82,10 +118,10 @@ def normalize(mx):
     r_mat_inv = sp.diags(r_inv)
     mx = r_mat_inv.dot(mx)
     return mx
-
+'''
 def load_data(config):
-    uiigraph = np.loadtxt(config.uiigraph_path, dtype = float)
-    kiigraph = np.loadtxt(config.kiigraph_path, dtype = float)
+    #uiigraph = np.loadtxt(config.uiigraph_path, dtype = float)
+    #kiigraph = np.loadtxt(config.kiigraph_path, dtype = float)
     #f = np.loadtxt(config.feature_path, dtype = float)
     #l = np.loadtxt(config.label_path, dtype = int)
     test = np.loadtxt(config.test_path, dtype = int)
@@ -102,18 +138,18 @@ def load_data(config):
     #label = torch.LongTensor(np.array(l))
 
     return uiigraph, kiigraph, idx_train, idx_test
-
+'''
 
 #def load_graph(dataset, config): 
-def load_graph(config):
-    featuregraph_path = config.kiigraph_path + str(config.k) + '.txt'
-    structgraph_path = config.uiigraph_path + str(config.k) + '.txt'
+def load_graph(config, n):
+    featuregraph_path = config.kiigraph_path + str(config.topk) + '.txt'
+    structgraph_path = config.uiigraph_path + str(config.topk) + '.txt'
 
     feature_edges = np.genfromtxt(featuregraph_path, dtype=np.int32)
     #build graph (pygcn utils file)
     fedges = np.array(list(feature_edges), dtype=np.int32).reshape(feature_edges.shape)
     fadj = sp.coo_matrix((np.ones(fedges.shape[0]), (fedges[:, 0], fedges[:, 1])), 
-                            shape=(config.n, config.n), dtype=np.float32)
+                            shape=(n, n), dtype=np.float32)
     #build symmetric adjacency matrix (pygcn utils file)
     fadj = fadj + fadj.T.multiply(fadj.T > fadj) - fadj.multiply(fadj.T > fadj)
     nfadj = normalize(fadj + sp.eye(fadj.shape[0]))
@@ -121,7 +157,7 @@ def load_graph(config):
     struct_edges = np.genfromtxt(structgraph_path, dtype=np.int32)
     sedges = np.array(list(struct_edges), dtype=np.int32).reshape(struct_edges.shape)
     sadj = sp.coo_matrix((np.ones(sedges.shape[0]), (sedges[:, 0], sedges[:, 1])), 
-                            shape=(config.n, config.n), dtype=np.float32)
+                            shape=(n, n), dtype=np.float32)
     sadj = sadj + sadj.T.multiply(sadj.T > sadj) - sadj.multiply(sadj.T > sadj)
     nsadj = normalize(sadj+sp.eye(sadj.shape[0]))
 

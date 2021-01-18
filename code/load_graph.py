@@ -3,7 +3,7 @@ LightGCN
 """
 import numpy as np
 from collections import defaultdict, OrderedDict
-import random as rd
+import random
 import scipy.sparse as sp
 from scipy.sparse import csr_matrix
 from time import time
@@ -11,23 +11,27 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-class UUI_Graph(object):
+class UI_Graph(object):
     """
     amazon-book dataset
     User-Item Interaction Graph
     Generate Adjacency matrix, topK Graph
     """
-    def __init__(self,dataset):
+    def __init__(self, config, dataset):
         #self.batch_size = batch_size
         self.dataset = dataset        
         self.n_users = 0
         self.n_items = 0
+        self.cf_batch_size = config.cf_batch_size
         train_file = '../data/'+dataset+'/train.txt'
         test_file = '../data/'+dataset+'/test.txt'
         trainUniqueUsers, trainItem, trainUser = [], [], []
         testUniqueUsers, testItem, testUser = [],[],[]
-        self.trainDataSize = 0
-        self.testDataSize = 0
+        self.n_train = 0
+        self.n_test = 0
+        #add - NGCF
+        self.neg_pools = {}
+        self.exist_users = []
 
         with open(train_file) as f:
             for l in f.readlines():
@@ -35,12 +39,13 @@ class UUI_Graph(object):
                     l = l.strip('\n').split(' ')
                     items = [int(i) for i in l[1:]]
                     uid = int(l[0])
+                    self.exist_users.append(uid)
                     trainUniqueUsers.append(uid)
                     trainUser.extend([uid]*len(items))
                     trainItem.extend(items)
                     self.n_items = max(self.n_items, max(items))
                     self.n_users = max(self.n_users, uid)
-                    self.trainDataSize += len(items)
+                    self.n_train += len(items)
         self.trainUniqueUsers = np.array(trainUniqueUsers)
         self.trainUser = np.array(trainUser)
         self.trainItem = np.array(trainItem)
@@ -57,6 +62,8 @@ class UUI_Graph(object):
                     except Exception:
                         continue
                     uid = int(l[0])
+
+                    self.exist_users.append(uid)
                     testUniqueUsers.append(uid)
                     testUser.extend([uid]*len(items))
                     testItem.extend(items)
@@ -69,31 +76,29 @@ class UUI_Graph(object):
                     '''
                     self.n_items = max(self.n_items, max(items))
                     self.n_users = max(self.n_users,uid)
-                    self.testDataSize += len(items)
+                    self.n_test += len(items)
+
         self.n_items += 1
         self.n_users += 1
         self.testUniqueUsers = np.array(testUniqueUsers)
         self.testUser = np.array(testUser)
         self.testItem = np.array(testItem)
-        f = open('../data/'+dataset+'/n_user_item.txt','a')
-        f.write(str(self.n_users)+'\n'+str(self.n_items))
-        f.close()
+        #f = open('../data/'+dataset+'/n_user_item.txt','a')
+        #f.write(str(self.n_users)+'\n'+str(self.n_items))
+        #f.close()
         self.Graph = None
-        print(f"{self.trainDataSize} interactions for training")
-        print(f"{self.testDataSize} interactions for testing")
+        print(f"{self.n_train} interactions for training")
+        print(f"{self.n_test} interactions for testing")
 
         # (users,items), bipartite graph
         self.UserItemNet = csr_matrix((np.ones(len(self.trainUser)), (self.trainUser, self.trainItem)),
                                             shape=(self.n_users, self.n_items))
-        print(self.UserItemNet.shape)
+        #print(self.UserItemNet.shape)
+
         self.users_D = np.array(self.UserItemNet.sum(axis=1)).squeeze()
         self.users_D[self.users_D == 0.] = 1.
         self.items_D = np.array(self.UserItemNet.sum(axis=0)).squeeze()
-        self.items_D[self.items_D == 0.] = 1.
-        # pre-calculate
-        #_allPos = self.getUserPosItems(list(range(self.n_user)))
-        #__testDict = self.__build_test()
-        #print(f"{world.dataset} is ready to go")
+        self.items_D[self.items_D == 0.] = 1.        
         '''
         generate knn txt files
         '''
@@ -102,7 +107,89 @@ class UUI_Graph(object):
         get sparse graph
         '''
         #self.getSparseGraph()
+        '''
+        get Userdict
+        '''
+        self.train_user_dict = self.load_cf(train_file)
+        self.test_user_dict = self.load_cf(test_file)
+        # pre-calculate
+        #self._allPos = self.getUserPosItems(list(range(self.n_user)))
+        #__testDict = self.__build_test()
+        #print(f"{world.dataset} is ready to go")
+    def sample_pos_items_for_u(self, user_dict, user_id, n_sample_pos_items):
+        pos_items = user_dict[user_id]
+        n_pos_items = len(pos_items)
+
+        sample_pos_items = []
+        while True:
+            if len(sample_pos_items) == n_sample_pos_items:
+                break
+            pos_item_idx = np.random.randint(low=0, high=n_pos_items, size=1)[0]
+            pos_item_id = pos_items[pos_item_idx]
+            if pos_item_id not in sample_pos_items:
+                sample_pos_items.append(pos_item_id)
+        return sample_pos_items
+    
+    def sample_neg_items_for_u(self, user_dict, user_id, n_sample_neg_items):
+        pos_items = user_dict[user_id]
+
+        sample_neg_items = []
+        while True:
+            if len(sample_neg_items) == n_sample_neg_items:
+                break
+            neg_item_id = np.random.randint(low=0, high=self.n_items, size=1)[0]
+            if neg_item_id not in pos_items and neg_item_id not in sample_neg_items:
+                sample_neg_items.append(neg_item_id)
+        return sample_neg_items
+
+    def generate_cf_batch(self, user_dict):
+        exist_users = user_dict.keys()
+        if self.cf_batch_size <= len(exist_users):
+            batch_user = random.sample(exist_users, self.cf_batch_size)
+        else:
+            batch_user = [random.sample(exist_users) for _ in range(self.cf_batch_size)]
+        batch_pos_item, batch_neg_item = [], []
+        for u in batch_user:
+            batch_pos_item += self.sample_pos_items_for_u(user_dict, u, 1)
+            batch_neg_item += self.sample_neg_items_for_u(user_dict, u, 1)
+
+        batch_user = torch.LongTensor(batch_user)
+        batch_pos_item = torch.LongTensor(batch_pos_item)
+        batch_neg_item = torch.LongTensor(batch_neg_item)
+        #print('batch_user: ',batch_user.shape)
+        #print('batch_pos: ',batch_pos_item.shape)
+        #print('batch_ng: ',batch_neg_item.shape)
+        return batch_user, batch_pos_item, batch_neg_item
+
+    def load_cf(self, filename):       
+        user_dict = dict()
+
+        lines = open(filename, 'r').readlines()
+        for l in lines:
+            tmp = l.strip()
+            inter = [int(i) for i in tmp.split()]
+
+            if len(inter) > 1:
+                user_id, item_ids = inter[0], inter[1:]
+                item_ids = list(set(item_ids))
+
+                user_dict[user_id] = item_ids
+
+        return user_dict
+
+    def getUserdict(self, filename):
+        user_dict = dict()
         
+        lines = open(filename, 'r').readlines()
+        for l in lines:
+            tmp = l.strip()
+            inter = [int(i) for i in tmp.split()]
+            if len(inter) > 1:
+                user_id, item_ids = inter[0], inter[1:]
+                item_ids = list(set(item_ids))
+                user_dict[user_id] = item_ids                
+        return user_dict
+
     def _convert_sp_mat_to_sp_tensor(self,X):
         coo = X.tocoo().astype(np.float32)
         row = torch.Tensor(coo.row).long()
@@ -116,7 +203,7 @@ class UUI_Graph(object):
         dataset = self.dataset
         if self.Graph is None:
             try:
-                pre_adj_mat = sp.load_npz('../data/' + dataset + '/' + 's_pre_adj_mat_' + dataset + '.npz')
+                pre_adj_mat = sp.load_npz('../data/' + dataset + '/ui_adj_mat.npz')
                 print("successfully loaded...")
                 norm_adj = pre_adj_mat
             except :
@@ -140,7 +227,7 @@ class UUI_Graph(object):
                 norm_adj = norm_adj.tocsr()
                 end = time()
                 print(f"costing {end-s}s, saved norm_mat...")
-                sp.save_npz('../data/' + dataset + '/' + 's_pre_adj_mat_' + dataset + '.npz', norm_adj)                
+                sp.save_npz('../data/' + dataset + '/ui_adj_mat.npz', norm_adj)                
 
                 #if self.split == True:
                 #    self.Graph = self._split_A_hat(norm_adj)
@@ -154,7 +241,7 @@ class UUI_Graph(object):
         return self.Graph
 
     def generate_knn(self,dataset):
-        for topk in range(5,9):
+        for topk in range(2,4):
             t1 = time()
             data = self.UserItemNet.copy()
             inds = []
@@ -185,32 +272,33 @@ class II_Graph(object):
     Generate Adjacency matrix, topK Graph
     """
     def __init__(self,dataset):
-        path = "../data/"+dataset
-        kg_file = path + "/kg_final.txt"
-        item_file = path + "/item_list.txt"
-        entity_file = path + "/entity_list.txt"
-        load_data(kg_file, item_file, entity_file)
+        self.dataset = dataset
+        path = '../data/'+ self.dataset
+        self.kg_file = path + '/kg_final.txt'
+        self.item_file = path + '/item_list.txt'
+        self.entity_file = path + '/entity_list.txt'
+        #self.load_data()
         
-    def load_data(kg_file, item_file, entity_file):
-        f_i = open(item_file, 'r')
+    def load_data(self):
+        f_i = open(self.item_file, 'r')
         n_item = f_i.read().count('\n') - 1
         f_i.close()
     
-        f_e = open(entity_file, 'r')
-        n_entity = f_e.read().count('\n') - 1 #includes number of item
-        f_e.close()
-
-        kg_np = np.loadtxt(kg_file, dtype=np.int32)
+        #f_e = open(self.entity_file, 'r')
+        #n_entity = f_e.read().count('\n') - 1 #includes number of item
+        #f_e.close()
+    
+        kg_np = np.loadtxt(self.kg_file, dtype=np.int32)
         kg_np = np.unique(kg_np, axis=0)
 
         _dict = defaultdict(set)
         for kg in kg_np:
-            if kg[0] < n_item:
+            if kg[0] < n_item and (kg[2] > n_item or kg[2] == n_item):
                 _dict[kg[0]].add(kg[2])
-            elif kg[2] < n_item:
+            elif kg[2] < n_item and (kg[0] > n_item or kg[0] == n_item):
                 _dict[kg[2]].add(kg[0])
         _dict = OrderedDict(sorted(_dict.items()))
-        print(_dict)
+        #print(_dict)
         _dist = list()
         for dic1 in _dict:
             tmp = list()
@@ -223,13 +311,13 @@ class II_Graph(object):
 
         for dist in _dist:
             tmp = sorted(sorted(dist, key=lambda x: x[1]), key=lambda x: x[0], reverse=True)
-            print(tmp[:5])
-            for idx in range(2, 10):
-                f = open("./kNN/" + str(idx) + "-NN.txt", "a")
-                f.write(str(tmp[0][2]) + " ")
+            #print(tmp[:5])
+            for idx in range(2,4):
+                f = open('../data/'+ self.dataset + '/kii_knn/c' + str(idx) + '.txt', 'a')
+                #f.write(str(tmp[0][2]) + " ")
                 for i in range(idx):
-                    f.write(str(tmp[i][3]) + " ")
-                f.write("\n")
+                    f.write(str(tmp[i][2]) + ' ' + str(tmp[i][3]) + '\n')
+                #f.write("\n")
                 f.close()
 
 
